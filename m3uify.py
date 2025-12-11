@@ -1,12 +1,19 @@
 import sys
 import json
 import os
+import curses
+import subprocess
 import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.oauth2 import SpotifyOAuth
 
 CONFIG_FILE = "config.json"
+TOKEN_FILE = "token.json"
+SCOPES = "playlist-read-private playlist-read-collaborative"
 
 
+# -------------------------------
+# CONFIG SYSTEM
+# -------------------------------
 def save_config(client_id, client_secret):
     config = {
         "SPOTIFY_CLIENT_ID": client_id,
@@ -14,38 +21,172 @@ def save_config(client_id, client_secret):
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
-    print("✅ Credentials saved to config.json")
-    print("Run again with: python playlistify.py <playlist_url>")
+
+    print("✅ Credentials saved.")
+    print("Run again with: python3 m3uify.py")
+    sys.exit(0)
 
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
-        print("❌ ERROR: No credentials found!")
-        print("Set credentials using:")
-        print("python playlistify.py -config CLIENT_ID CLIENT_SECRET")
+        print("❌ No credentials found!")
+        print("Run: python3 m3uify.py -config CLIENT_ID CLIENT_SECRET")
         sys.exit(1)
 
-    with open(CONFIG_FILE, "r") as f:
+    with open(CONFIG_FILE) as f:
         config = json.load(f)
 
     return config["SPOTIFY_CLIENT_ID"], config["SPOTIFY_CLIENT_SECRET"]
 
 
-def create_m3u_from_playlist(url):
+# -------------------------------
+# SPOTIFY AUTH
+# -------------------------------
+def get_spotify_client():
     client_id, client_secret = load_config()
 
-    sp = spotipy.Spotify(
-        auth_manager=SpotifyClientCredentials(
-            client_id=client_id,
-            client_secret=client_secret
-        )
+    oauth = SpotifyOAuth(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri="http://127.0.0.1:8080/callback",
+        scope=SCOPES,
+        cache_path=TOKEN_FILE
     )
 
-    playlist = sp.playlist(url)
-    playlist_name = playlist["name"].replace("/", "_").replace("\\", "_")
-    m3u_filename = f"{playlist_name}.m3u"
+    token = oauth.get_access_token(as_dict=False)
+    return spotipy.Spotify(auth=token)
 
-    print(f"🎵 Creating playlist: {m3u_filename}")
+
+# -------------------------------
+# FETCH USER PLAYLISTS
+# -------------------------------
+def fetch_playlists(sp):
+    playlists = []
+    results = sp.current_user_playlists()
+
+    while results:
+        for item in results["items"]:
+            playlists.append({
+                "name": item["name"],
+                "id": item["id"]
+            })
+        results = sp.next(results) if results["next"] else None
+
+    return playlists
+
+
+# -------------------------------
+# TEXT SAFETY
+# -------------------------------
+def safe_text(text, width):
+    if width <= 10:
+        return text[:width - 1]
+    if len(text) >= width - 4:
+        return text[:width - 7] + "..."
+    return text
+
+
+# -------------------------------
+# CURSES: PLAYLIST SELECTION MENU
+# -------------------------------
+def playlist_menu(stdscr, playlists):
+    curses.curs_set(0)
+
+    # COLORS
+    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)   # header
+    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK) # selected item (reverse)
+    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLACK)  # normal row
+
+    selected = 0
+
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+
+        stdscr.attron(curses.color_pair(1))
+        stdscr.addstr(0, 0, safe_text("Select a playlist and press ENTER", width))
+        stdscr.attroff(curses.color_pair(1))
+
+        max_items = height - 3
+        if max_items < 1:
+            max_items = 1
+
+        start_idx = max(0, selected - max_items + 1)
+        end_idx = min(len(playlists), start_idx + max_items)
+
+        row = 2
+        for i in range(start_idx, end_idx):
+            name = safe_text(playlists[i]["name"], width)
+
+            if i == selected:
+                stdscr.attron(curses.color_pair(2) | curses.A_REVERSE)
+                stdscr.addstr(row, 2, "> " + name)
+                stdscr.attroff(curses.color_pair(2) | curses.A_REVERSE)
+            else:
+                stdscr.attron(curses.color_pair(3))
+                stdscr.addstr(row, 2, "  " + name)
+                stdscr.attroff(curses.color_pair(3))
+
+            row += 1
+
+        key = stdscr.getch()
+
+        if key == curses.KEY_UP and selected > 0:
+            selected -= 1
+        elif key == curses.KEY_DOWN and selected < len(playlists) - 1:
+            selected += 1
+        elif key in (10, 13):
+            return playlists[selected]
+
+
+# -------------------------------
+# CURSES: ACTION MENU
+# -------------------------------
+def action_menu(stdscr):
+    curses.curs_set(0)
+
+    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLACK)
+
+    options = ["Create M3U", "Download Songs", "Both", "Cancel"]
+    selected = 0
+
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+
+        stdscr.attron(curses.color_pair(1))
+        stdscr.addstr(0, 0, safe_text("Choose an action:", width))
+        stdscr.attroff(curses.color_pair(1))
+
+        for i, option in enumerate(options):
+            if i == selected:
+                stdscr.attron(curses.color_pair(2) | curses.A_REVERSE)
+                stdscr.addstr(i + 2, 2, "> " + option)
+                stdscr.attroff(curses.color_pair(2) | curses.A_REVERSE)
+            else:
+                stdscr.attron(curses.color_pair(3))
+                stdscr.addstr(i + 2, 2, "  " + option)
+                stdscr.attroff(curses.color_pair(3))
+
+        key = stdscr.getch()
+
+        if key == curses.KEY_UP and selected > 0:
+            selected -= 1
+        elif key == curses.KEY_DOWN and selected < len(options) - 1:
+            selected += 1
+        elif key in (10, 13):
+            return options[selected]
+
+
+# -------------------------------
+# CREATE M3U FILE
+# -------------------------------
+def create_m3u(sp, playlist_id, playlist_name):
+    playlist = sp.playlist(playlist_id)
+    playlist_name = playlist_name.replace("/", "_").replace("\\", "_")
+    filename = f"{playlist_name}.m3u"
 
     tracks = []
     results = playlist["tracks"]
@@ -56,32 +197,98 @@ def create_m3u_from_playlist(url):
                 tracks.append(item["track"])
         results = sp.next(results) if results["next"] else None
 
-    with open(m3u_filename, "w", encoding="utf-8") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n\n")
         for track in tracks:
             title = track["name"]
             artists = ", ".join(a["name"] for a in track["artists"])
             f.write(f"{artists} - {title}\n")
 
-    print(f"✅ Done! Saved: {m3u_filename}")
+    print(f"✅ M3U saved: {filename}")
 
 
+# -------------------------------
+# DOWNLOAD SONGS VIA SPOTDL
+# -------------------------------
+def download_songs(sp, playlist_id, playlist_name):
+    folder = playlist_name.replace("/", "_").replace("\\", "_")
+
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    print(f"🎧 Download folder: {folder}")
+
+    # Fetch playlist tracks
+    tracks = []
+    results = sp.playlist_tracks(playlist_id)
+
+    while results:
+        for item in results["items"]:
+            if item["track"]:
+                tracks.append(item["track"])
+        results = sp.next(results) if results["next"] else None
+
+    # Download each track using NEW spotdl syntax
+    for track in tracks:
+        title = track["name"]
+        artists = ", ".join(a["name"] for a in track["artists"])
+        query = f"{artists} - {title}"
+
+        print(f"  ↳ Downloading: {query}")
+
+        subprocess.run([
+            "spotdl",
+            "download",
+            query,
+            "--output", folder,
+            "--format", "mp3"
+        ])
+
+
+
+# -------------------------------
+# MAIN PROGRAM
+# -------------------------------
 if __name__ == "__main__":
+
+    # CONFIG MODE
     if len(sys.argv) >= 2 and sys.argv[1] == "-config":
         if len(sys.argv) != 4:
-            print("Usage: python playlistify.py -config CLIENT_ID CLIENT_SECRET")
+            print("Usage: python3 m3uify.py -config CLIENT_ID CLIENT_SECRET")
             sys.exit(1)
-
         save_config(sys.argv[2], sys.argv[3])
+
+    # URL MODE
+    if len(sys.argv) == 2:
+        sp = get_spotify_client()
+        playlist_url = sys.argv[1]
+        playlist = sp.playlist(playlist_url)
+        create_m3u(sp, playlist["id"], playlist["name"])
         sys.exit(0)
 
-    # Regular execution
-    if len(sys.argv) != 2:
-        
-        print("Usage:")
-        print("  python playlistify.py -config CLIENT_ID CLIENT_SECRET")
-        print("  python playlistify.py <spotify_playlist_url>")
+    # INTERACTIVE MODE
+    sp = get_spotify_client()
+    playlists = fetch_playlists(sp)
+
+    if not playlists:
+        print("❌ No playlists found!")
         sys.exit(1)
 
-    playlist_url = sys.argv[1]
-    create_m3u_from_playlist(playlist_url)
+    selected = curses.wrapper(playlist_menu, playlists)
+    action = curses.wrapper(action_menu)
+
+    pid = selected["id"]
+    pname = selected["name"]
+
+    if action == "Create M3U":
+        create_m3u(sp, pid, pname)
+
+    elif action == "Download Songs":
+        download_songs(sp, pid, pname)
+
+    elif action == "Both":
+        create_m3u(sp, pid, pname)
+        download_songs(sp, pid, pname)
+
+    else:
+        print("Cancelled.")
